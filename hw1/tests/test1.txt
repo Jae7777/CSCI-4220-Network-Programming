@@ -1,0 +1,5 @@
+This is a filler test file for auto fill demonstration purposes.
+The quick brown fox jumps over the lazy dog.
+Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+1234567890
+End of test file.
