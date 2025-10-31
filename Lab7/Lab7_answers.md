@@ -1,4 +1,4 @@
-Justin Chen, Suyash Amatya
+Justin Chen
 
 October 31, 2025
 
