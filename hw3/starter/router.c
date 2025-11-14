@@ -218,43 +218,180 @@ static inline int udp_bind(uint16_t p){
     return s;
 }
 
-/* -------------------------------------------------------------------------
- * TODO #1: Send Distance Vector update to a single neighbor
- *    - Fill dv_msg_t with routes and costs
- *    - Apply Split Horizon + Poison Reverse logic
- *    - Use sendto() to transmit the message
- * ------------------------------------------------------------------------- */
 static void send_dv(router_t* R, const neighbor_t* nb){
-    // TODO: Build DV message and send it to neighbor nb
+    dv_msg_t msg;
+    msg.type = MSG_DV;
+    msg.sender_id = htons(R->self_id);
+    msg.num = 0;
+    
+    for (int i = 0; i < R->num_routes; i++) {
+        if (msg.num >= MAX_DEST) break;
+        
+        route_entry_t* route = &R->routes[i];
+        uint16_t cost = route->cost;
+        
+        if (route->next_hop != 0 && route->next_hop == nb->ip) {
+            cost = INF_COST;
+        }
+        
+        msg.e[msg.num].net = route->dest_net;
+        msg.e[msg.num].mask = route->mask;
+        msg.e[msg.num].cost = htons(cost);
+        msg.num++;
+    }
+    
+    msg.num = htons(msg.num);
+    
+    struct sockaddr_in dest;
+    dest.sin_family = AF_INET;
+    dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dest.sin_port = htons(nb->ctrl_port);
+    
+    size_t msg_size = sizeof(msg.type) + sizeof(msg.sender_id) + sizeof(msg.num) +
+                      ntohs(msg.num) * sizeof(msg.e[0]);
+    
+    sendto(R->sock_ctrl, &msg, msg_size, 0, (struct sockaddr*)&dest, sizeof(dest));
 }
 
-/* -------------------------------------------------------------------------
- * TODO #2: Broadcast DV updates to all alive neighbors
- * ------------------------------------------------------------------------- */
 static void broadcast_dv(router_t* R){
-    // TODO: Loop over neighbors and call send_dv() for each alive neighbor
+    for (int i = 0; i < R->num_neighbors; i++) {
+        if (R->neighbors[i].alive) {
+            send_dv(R, &R->neighbors[i]);
+        }
+    }
 }
 
-/* -------------------------------------------------------------------------
- * TODO #3: Apply Bellman-Ford update rule
- *    - For each entry in received DV:
- *        new_cost = neighbor_cost + advertised_cost
- *    - If this is a cheaper path, update route table
- * ------------------------------------------------------------------------- */
 static bool dv_update(router_t* R, neighbor_t* nb, const dv_msg_t* m){
     bool changed = false;
-    // TODO: Implement Bellman-Ford update logic
+    uint16_t num_entries = ntohs(m->num);
+    
+    for (int i = 0; i < num_entries; i++) {
+        uint32_t net = m->e[i].net;
+        uint32_t mask = m->e[i].mask;
+        uint16_t neighbor_cost = ntohs(m->e[i].cost);
+        
+        if (neighbor_cost >= INF_COST) {
+            route_entry_t* existing = rt_find_or_add(R, net, mask);
+            if (existing && existing->next_hop == nb->ip && existing->cost < INF_COST) {
+                existing->cost = INF_COST;
+                existing->last_update = time(NULL);
+                changed = true;
+            }
+            continue;
+        }
+        
+        uint32_t new_cost = (uint32_t)nb->cost + (uint32_t)neighbor_cost;
+        if (new_cost > INF_COST) new_cost = INF_COST;
+
+        route_entry_t* route = rt_find_or_add(R, net, mask);
+        if (!route) continue;
+        
+        if (new_cost < route->cost || (route->next_hop == nb->ip && new_cost != route->cost)) {
+            route->cost = (uint16_t)new_cost;
+            route->next_hop = nb->ip;
+            route->last_update = time(NULL);
+            changed = true;
+        }
+    }
+    
     return changed;
 }
 
-/* -------------------------------------------------------------------------
- * TODO #4: Forward data packets based on routing table
- *    - Decrement TTL
- *    - Perform LPM lookup to find next hop
- *    - Forward via UDP or deliver locally if directly connected
- * ------------------------------------------------------------------------- */
 static void forward_data(router_t* R, const data_msg_t* in){
-    // TODO: Implement packet forwarding using LPM
+    char buf[32];
+    
+    route_entry_t* match = rt_lookup(R, in->dst_ip);
+    if (match && match->cost == 0 && match->next_hop == 0) {
+        printf("[R%u] DELIVER connected dst=%s payload=\"%.*s\"\n",
+               R->self_id, ipstr(in->dst_ip, buf, sizeof(buf)),
+               ntohs(in->payload_len), in->payload);
+        fflush(stdout);
+        return;
+    }
+    
+    if (in->dst_ip == R->self_ip) {
+        printf("[R%u] DELIVER self src=%s ttl=%u payload=\"%.*s\"\n",
+               R->self_id, ipstr(in->src_ip, buf, sizeof(buf)),
+               in->ttl, ntohs(in->payload_len), in->payload);
+        fflush(stdout);
+        return;
+    }
+    
+    if (in->ttl == 0) {
+        printf("[R%u] DROP ttl=0\n", R->self_id);
+        fflush(stdout);
+        return;
+    }
+    
+    route_entry_t* route = rt_lookup(R, in->dst_ip);
+    if (!route) {
+        printf("[R%u] NO MATCH dst=%s\n", R->self_id, ipstr(in->dst_ip, buf, sizeof(buf)));
+        fflush(stdout);
+        return;
+    }
+    
+    if (route->cost >= INF_COST) {
+        printf("[R%u] NO MATCH dst=%s\n", R->self_id, ipstr(in->dst_ip, buf, sizeof(buf)));
+        fflush(stdout);
+        return;
+    }
+    
+    uint32_t next_hop_ip = route->next_hop;
+    if (next_hop_ip == 0) {
+        next_hop_ip = in->dst_ip;
+    }
+    
+    neighbor_t* nh_neighbor = NULL;
+    for (int i = 0; i < R->num_neighbors; i++) {
+        if (R->neighbors[i].ip == next_hop_ip) {
+            nh_neighbor = &R->neighbors[i];
+            break;
+        }
+    }
+    
+    if (nh_neighbor && !nh_neighbor->alive) {
+        printf("[R%u] NEXT HOP DOWN %s\n", R->self_id, ipstr(next_hop_ip, buf, sizeof(buf)));
+        fflush(stdout);
+        return;
+    }
+    
+    data_msg_t out = *in;
+    out.ttl = in->ttl - 1;
+    
+    // find neighbor's data port
+    uint16_t data_port = 0;
+    for (int i = 0; i < R->num_neighbors; i++) {
+        if (R->neighbors[i].ip == next_hop_ip) {
+            data_port = get_data_port(R->neighbors[i].ctrl_port);
+            break;
+        }
+    }
+    
+    if (data_port == 0) {
+        printf("[R%u] NO MATCH dst=%s\n", R->self_id, ipstr(in->dst_ip, buf, sizeof(buf)));
+        fflush(stdout);
+        return;
+    }
+    
+    struct sockaddr_in dest;
+    dest.sin_family = AF_INET;
+    dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dest.sin_port = htons(data_port);
+    
+    size_t pkt_size = sizeof(out.type) + sizeof(out.ttl) + sizeof(out.src_ip) + 
+                      sizeof(out.dst_ip) + sizeof(out.payload_len) + ntohs(out.payload_len);
+    
+    sendto(R->sock_data, &out, pkt_size, 0, (struct sockaddr*)&dest, sizeof(dest));
+    
+    char via_buf[32], mask_buf[32];
+    printf("[R%u] FWD dst=%s via=%s mask=%s cost=%u ttl=%u\n",
+           R->self_id,
+           ipstr(in->dst_ip, buf, sizeof(buf)),
+           ipstr(next_hop_ip, via_buf, sizeof(via_buf)),
+           ipstr(route->mask, mask_buf, sizeof(mask_buf)),
+           route->cost,
+           out.ttl);
+    fflush(stdout);
 }
 
 /* -------------------------------------------------------------------------
@@ -305,21 +442,70 @@ int main(int argc, char** argv){
 
         //Neighbor timeout detection
         for(int i=0; i<R.num_neighbors; i++){
-            // TODO: Neighbor timeout detection (use neighbor_t's last_heard)
-            // If timeout is detected, poison all routes learned from this neighbor
-            // Output a log message with log_table(&R, "neighbor-dead");
+            neighbor_t* nb = &R.neighbors[i];
+            if (nb->alive && (now - nb->last_heard) >= DEAD_INTERVAL_SEC) {
+                nb->alive = false;
+                
+                bool changed = false;
+                for (int j = 0; j < R.num_routes; j++) {
+                    if (R.routes[j].next_hop == nb->ip && R.routes[j].cost < INF_COST) {
+                        R.routes[j].cost = INF_COST;
+                        changed = true;
+                    }
+                }
+                
+                if (changed) {
+                    log_table(&R, "neighbor-dead");
+                    broadcast_dv(&R);
+                }
+            }
         }
 
         //Handle control (DV) messages
         if(n > 0 && FD_ISSET(R.sock_ctrl, &rfds)){
-            // TODO: Handle control (DV) messages and call dv_update
-            // If the routing table is changed, output a log message with log_table(&R,"dv-update")
-
+            dv_msg_t msg;
+            struct sockaddr_in from;
+            socklen_t fromlen = sizeof(from);
+            
+            ssize_t rcvd = recvfrom(R.sock_ctrl, &msg, sizeof(msg), 0,
+                                   (struct sockaddr*)&from, &fromlen);
+            
+            if (rcvd > 0 && msg.type == MSG_DV) {
+                neighbor_t* sender = NULL;
+                for (int i = 0; i < R.num_neighbors; i++) {
+                    if (R.neighbors[i].ctrl_port == ntohs(from.sin_port)) {
+                        sender = &R.neighbors[i];
+                        break;
+                    }
+                }
+                
+                if (sender) {
+                    sender->last_heard = now;
+                    
+                    if (!sender->alive) {
+                        sender->alive = true;
+                    }
+                    
+                    bool changed = dv_update(&R, sender, &msg);
+                    
+                    if (changed) {
+                        log_table(&R, "dv-update");
+                    }
+                }
+            }
         }
         
-        // TODO: Handle data packets
         if(n > 0 && FD_ISSET(R.sock_data, &rfds)){
-            // TODO: Handle data packets and call forward_data
+            data_msg_t pkt;
+            struct sockaddr_in from;
+            socklen_t fromlen = sizeof(from);
+            
+            ssize_t rcvd = recvfrom(R.sock_data, &pkt, sizeof(pkt), 0,
+                                   (struct sockaddr*)&from, &fromlen);
+            
+            if (rcvd > 0 && pkt.type == MSG_DATA) {
+                forward_data(&R, &pkt);
+            }
         }
     }
 
